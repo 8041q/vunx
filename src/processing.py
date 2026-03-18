@@ -3,6 +3,30 @@ import numpy as np
 import traceback
 import sys
 
+# Availability probe — checked once, cached forever
+_sklearn_available: bool | None = None
+
+
+def sklearn_available() -> bool:
+    """Return True if scikit-learn can be imported (cached after first call)."""
+    global _sklearn_available
+    if _sklearn_available is None:
+        try:
+            import sklearn  # noqa: F401
+            _sklearn_available = True
+        except Exception:
+            _sklearn_available = False
+    return _sklearn_available
+
+
+def active_dither_method() -> str:
+    """Return the name of the dither algorithm that will actually be used.
+
+    'Bayer (ordered)'  — when sklearn is present and k-means path is active.
+    'Floyd–Steinberg'  — when sklearn is absent and Pillow fallback is used.
+    """
+    return "Bayer (ordered)" if sklearn_available() else "Floyd–Steinberg"
+
 
 def resample_image(img: Image.Image, scale: float) -> Image.Image:
     if scale == 1.0:
@@ -80,18 +104,8 @@ _DITHER_CHUNK = 65536  # max rows per batch when computing the (N, k) distance m
 
 
 def _ordered_dither(rgb_hw3: np.ndarray, palette: np.ndarray, bayer_order: int = 3) -> np.ndarray:
-    """Apply Bayer ordered dithering and snap each perturbed pixel to the nearest palette color.
-
-    Fully vectorized — no per-pixel Python loops.
-
-    Args:
-        rgb_hw3: (h, w, 3) float32 array with values in [0, 255].
-        palette:  (k, 3) float32 palette array.
-        bayer_order: Bayer matrix order (default 3 → 8×8 matrix).
-
-    Returns:
-        (h, w, 3) uint8 array of dithered, quantized pixel values.
-    """
+    # Apply Bayer ordered dithering and snap each perturbed pixel to the nearest palette color.
+    
     h, w = rgb_hw3.shape[:2]
     k = len(palette)
 
@@ -231,7 +245,7 @@ def quantize_kmeans(img: Image.Image, colors: int = 16, sample_rate: float = 0.1
     return _numpy_rgba_to_pil(rgb_q, alpha_flat, (w, h))
 
 
-def process_image(img: Image.Image, scale: float = 1.0, blur_radius: float = 0.0, colors: int = 16, dither: bool = True) -> Image.Image:
+def process_image(img: Image.Image, scale: float = 1.0, blur_radius: float = 0.0, colors: int = 16, dither: bool = True, use_pillow_dither: bool = False) -> Image.Image:
     """Run a minimal pipeline: resample -> blur -> quantize
 
     Args:
@@ -239,7 +253,9 @@ def process_image(img: Image.Image, scale: float = 1.0, blur_radius: float = 0.0
         scale: scale factor (1.0 = native)
         blur_radius: gaussian blur radius
         colors: number of palette colors
-        dither: apply Bayer ordered dithering (NumPy vectorized; Pillow fallback if sklearn unavailable)
+        dither: apply dithering
+        use_pillow_dither: if True, force Floyd–Steinberg via Pillow even when sklearn
+            is available; if False, use Bayer k-means when sklearn is present.
 
     Returns:
         Processed PIL Image (RGBA)
@@ -247,10 +263,11 @@ def process_image(img: Image.Image, scale: float = 1.0, blur_radius: float = 0.0
     img = img.copy()
     img = resample_image(img, scale)
     img = blur_image(img, blur_radius)
-    # Use k-means quantizer by default for performance; but keep dither fallback behavior
-    try:
-        img = quantize_kmeans(img, colors=colors, sample_rate=0.1, batch_size=1000, random_state=0, dither=dither)
-    except Exception:
-        # any unexpected failure -> safe fallback to Pillow
+    if use_pillow_dither or not sklearn_available():
         img = quantize_image(img, colors=colors, dither=dither)
+    else:
+        try:
+            img = quantize_kmeans(img, colors=colors, sample_rate=0.1, batch_size=1000, random_state=0, dither=dither)
+        except Exception:
+            img = quantize_image(img, colors=colors, dither=dither)
     return img

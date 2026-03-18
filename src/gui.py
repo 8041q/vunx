@@ -23,7 +23,7 @@ from PIL import Image, ImageFilter
 import sys
 import traceback
 
-from .processing import process_image
+from .processing import process_image, sklearn_available
 
 import concurrent.futures
 import threading
@@ -76,12 +76,10 @@ class MainWindow(QMainWindow):
 
         self.open_btn = QPushButton("Open Image")
         self.save_btn = QPushButton("Save Result")
-        self.apply_btn = QPushButton("Apply")
 
         left_layout.addWidget(self.open_btn)
         left_layout.addWidget(self.save_btn)
         left_layout.addStretch()
-        left_layout.addWidget(self.apply_btn)
 
         # Right group (processing options)
         right_group = QGroupBox("Processing")
@@ -111,8 +109,11 @@ class MainWindow(QMainWindow):
         self.colors_spin.setRange(2, 256)
         self.colors_spin.setValue(16)
 
-        self.dither_check = QCheckBox("Dither (Floyd–Steinberg)")
+        self.dither_check = QCheckBox("Dither")
         self.dither_check.setChecked(True)
+
+        self.dither_method_combo = QComboBox()
+        self.dither_method_combo.addItems(["Bayer (k-means)", "Floyd–Steinberg"])
 
         self.resample_combo = QComboBox()
         self.resample_combo.addItems(["Nearest", "Bilinear", "Bicubic", "Lanczos"])
@@ -143,6 +144,7 @@ class MainWindow(QMainWindow):
         right_layout.addWidget(QLabel("Colors"))
         right_layout.addWidget(self.colors_spin)
         right_layout.addWidget(self.dither_check)
+        right_layout.addWidget(self.dither_method_combo)
         right_layout.addWidget(QLabel("Resample"))
         right_layout.addWidget(self.resample_combo)
         right_layout.addStretch()
@@ -164,10 +166,15 @@ class MainWindow(QMainWindow):
         central_layout.addWidget(preview_container, 1)
         central_layout.addWidget(right_group)
 
+        # Lock the side panels to a fixed width so changing label text never
+        # causes them to grow or shrink.
+        _PANEL_WIDTH = 250
+        left_group.setFixedWidth(_PANEL_WIDTH)
+        right_group.setFixedWidth(_PANEL_WIDTH)
+
         # Connections
         self.open_btn.clicked.connect(self.open_image)
         self.save_btn.clicked.connect(self.save_result)
-        self.apply_btn.clicked.connect(self.apply_processing)
 
         # Live preview debounce timer
         self._preview_timer = QTimer(self)
@@ -187,12 +194,28 @@ class MainWindow(QMainWindow):
 
         self.colors_spin.valueChanged.connect(self.schedule_preview)
         self.dither_check.toggled.connect(self.schedule_preview)
+        self.dither_method_combo.currentIndexChanged.connect(self.schedule_preview)
         self.resample_combo.currentIndexChanged.connect(self.schedule_preview)
 
-        self.resize(1000, 700)
+        self._update_dither_controls()
+
+        self.setMinimumSize(1100, 700)
+        self.resize(1100, 700)
 
         # ensure there is a status bar for simple busy feedback
         self.statusBar().showMessage("")
+
+    def _update_dither_controls(self):
+        """Enable/disable the dither method combo based on sklearn availability.
+
+        Bayer (k-means) requires sklearn; if it's not installed, lock the combo
+        to Floyd–Steinberg and grey it out so the user knows it's unavailable.
+        """
+        has_sklearn = sklearn_available()
+        if not has_sklearn:
+            # Force selection to Floyd–Steinberg and disable choice
+            self.dither_method_combo.setCurrentIndex(1)
+        self.dither_method_combo.setEnabled(has_sklearn)
 
     def schedule_preview(self, *_args):
         # start or restart debounce timer
@@ -240,6 +263,8 @@ class MainWindow(QMainWindow):
         blur = self.blur_spin.value()
         colors = self.colors_spin.value()
         dither = self.dither_check.isChecked()
+        # 0 = Bayer (k-means), 1 = Floyd–Steinberg (Pillow)
+        use_pillow_dither = self.dither_method_combo.currentIndex() == 1
         resample_idx = self.resample_combo.currentIndex()
         resample_filter = self.resample_map.get(resample_idx, Image.LANCZOS)
 
@@ -258,33 +283,32 @@ class MainWindow(QMainWindow):
         img = img if blur <= 0 else img.filter(ImageFilter.GaussianBlur(blur))
 
         # Use background worker to avoid blocking the UI
-        self._start_worker(img, colors, dither)
+        self._start_worker(img, colors, dither, use_pillow_dither)
 
-    def _start_worker(self, img, colors, dither):
+    def _start_worker(self, img, colors, dither, use_pillow_dither=False):
         # If a job is already running, store the latest params and return (coalesce)
         if self._current_future is not None and not self._current_future.done():
-            self._pending_params = (img, colors, dither)
+            self._pending_params = (img, colors, dither, use_pillow_dither)
             return
 
-        print("[gui] Submitting processing job: colors=", colors, "dither=", dither)
+        print("[gui] Submitting processing job: colors=", colors, "dither=", dither, "pillow=", use_pillow_dither)
         sys.stdout.flush()
 
         # wrapper around process_image to trace start/finish inside the worker thread
-        def _process_wrapper(img_, scale_, blur_, colors_, dither_):
-            print(f"[worker:{threading.get_ident()}] started process_image: colors={colors_} dither={dither_}")
+        def _process_wrapper(img_, scale_, blur_, colors_, dither_, use_pillow_dither_):
+            print(f"[worker:{threading.get_ident()}] started process_image: colors={colors_} dither={dither_} pillow={use_pillow_dither_}")
             sys.stdout.flush()
-            res = process_image(img_, scale_, blur_, colors_, dither_)
+            res = process_image(img_, scale_, blur_, colors_, dither_, use_pillow_dither=use_pillow_dither_)
             print(f"[worker:{threading.get_ident()}] finished process_image")
             sys.stdout.flush()
             return res
 
         # Submit processing to thread pool; pass PIL Image directly
-        future = self._process_pool.submit(_process_wrapper, img, 1.0, 0.0, colors, dither)
+        future = self._process_pool.submit(_process_wrapper, img, 1.0, 0.0, colors, dither, use_pillow_dither)
         self._current_future = future
 
         # simple UI feedback
         self.statusBar().showMessage("Processing...")
-        self.apply_btn.setEnabled(False)
 
         # Use a Qt signal to marshal the Future to the GUI thread
         future.add_done_callback(lambda f: self.processing_done.emit(f))
@@ -302,9 +326,6 @@ class MainWindow(QMainWindow):
 
         # clear busy state
         self.statusBar().clearMessage()
-        self.apply_btn.setEnabled(True)
-
-        # if there was a newer request while we were running, start it now
         if self._pending_params is not None:
             params = self._pending_params
             self._pending_params = None
@@ -346,10 +367,12 @@ class MainWindow(QMainWindow):
         # clear busy state
         print("[gui] Clearing busy state")
         self.statusBar().clearMessage()
-        self.apply_btn.setEnabled(True)
 
         # clear current future
         self._current_future = None
+
+        # refresh dither controls — sklearn may have become unavailable mid-session
+        self._update_dither_controls()
 
         # handle queued params
         if self._pending_params is not None:
