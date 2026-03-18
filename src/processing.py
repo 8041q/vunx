@@ -19,11 +19,17 @@ def blur_image(img: Image.Image, radius: float) -> Image.Image:
 
 
 def quantize_image(img: Image.Image, colors: int = 16, dither: bool = True) -> Image.Image:
-    # Convert to RGB then use adaptive palette conversion (Pillow)
+    # Pillow's quantize() only honours the dither flag when a palette= reference
+    # image is provided — in the normal (no palette) path the argument is silently
+    # ignored.  The fix is a two-step approach:
+    #   1. Build the palette with a plain quantize() call (dither irrelevant here).
+    #   2. Re-quantize the original using that palette so the dither flag is used.
     img_rgb = img.convert("RGB")
-    dither_flag = Image.FLOYDSTEINBERG if dither else Image.NONE
-    pal = img_rgb.convert("P", palette=Image.ADAPTIVE, colors=max(1, colors), dither=dither_flag)
-    return pal.convert("RGBA")
+    n = max(1, colors)
+    dither_flag = Image.Dither.FLOYDSTEINBERG if dither else Image.Dither.NONE
+    palette_img = img_rgb.quantize(colors=n, method=Image.Quantize.MEDIANCUT, dither=Image.Dither.NONE)
+    quantized = img_rgb.quantize(colors=n, palette=palette_img, dither=dither_flag)
+    return quantized.convert("RGBA")
 
 
 # --- New helpers and k-means quantizer ---
