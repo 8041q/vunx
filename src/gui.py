@@ -11,13 +11,17 @@ from PySide6.QtWidgets import (
     QSpinBox,
     QDoubleSpinBox,
     QCheckBox,
-    QMenuBar,
     QGroupBox,
     QSizePolicy,
     QComboBox,
+    QToolBar,
+    QToolButton,
+    QMessageBox,
+    QDialog,
+    QDialogButtonBox,
 )
-from PySide6.QtCore import Qt, QTimer, Signal
-from PySide6.QtGui import QPixmap, QAction
+from PySide6.QtCore import Qt, QTimer, Signal, QSize, QPointF, QRectF
+from PySide6.QtGui import QPixmap, QAction, QWheelEvent, QPainter, QCursor, QPalette
 from PIL.ImageQt import ImageQt
 from PIL import Image, ImageFilter
 import sys
@@ -29,59 +33,285 @@ import concurrent.futures
 import threading
 
 
+# ---------------------------------------------------------------------------
+# Canvas widget — handles all pan / zoom rendering internally
+# ---------------------------------------------------------------------------
+
+class _PreviewCanvas(QWidget):
+    """A widget that draws a QPixmap with pan and zoom.
+
+    Coordinate convention
+    ─────────────────────
+    _zoom        : pixels of *screen* per pixel of *image*  (1.0 = 1:1)
+    _pan_offset  : QPointF — top-left corner of the image in widget coords
+
+    When _zoom <= 0 the widget is in "fit" mode and the offset is ignored;
+    the image is centred and scaled to fill the widget.
+    """
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setMouseTracking(True)
+        self.setCursor(Qt.OpenHandCursor)
+        self.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
+        self.setMinimumSize(200, 200)
+        self.setStyleSheet("background-color: #222;")
+
+        self._pixmap: QPixmap | None = None
+        self._ref_size: tuple[int, int] | None = None  # original image dims (w, h)
+        self._zoom: float = 0.0        # 0 = fit, >0 = explicit
+        self._pan_offset = QPointF(0, 0)
+
+        self._drag_active = False
+        self._drag_start_mouse = QPointF()
+        self._drag_start_offset = QPointF()
+
+    # ── public API ────────────────────────────────────────────────────────────
+
+    def set_pixmap(self, pix: QPixmap | None, ref_size: tuple[int, int] | None = None):
+        """Set pixmap and reset zoom/pan to fit. Call on image open.
+
+        ref_size: (w, h) of the original (unscaled) image. All zoom arithmetic
+        is done against this size so that changing the processing scale slider
+        does not affect the displayed zoom level.
+        """
+        self._pixmap = pix
+        if ref_size is not None:
+            self._ref_size = ref_size
+        elif pix is not None:
+            self._ref_size = (pix.width(), pix.height())
+        else:
+            self._ref_size = None
+        self._zoom = 0.0
+        self._pan_offset = QPointF(0, 0)
+        self.update()
+
+    def set_pixmap_keep_view(self, pix: QPixmap | None):
+        """Swap pixmap content without touching zoom or pan.
+
+        Use this for live-preview / processing results: the display size is
+        determined by _ref_size + _zoom, so the image won't jump even if the
+        new pixmap has different pixel dimensions (due to scale slider).
+        """
+        self._pixmap = pix
+        self.update()
+
+    def reset_view(self):
+        """Return to fit mode."""
+        self._zoom = 0.0
+        self._pan_offset = QPointF(0, 0)
+        self.update()
+
+    def apply_zoom(self, factor: float, anchor: QPointF | None = None):
+        """Zoom by *factor*, keeping the screen point *anchor* fixed."""
+        if self._pixmap is None or self._ref_size is None:
+            return
+
+        old_zoom = self._effective_zoom()
+        new_zoom = max(0.05, min(32.0, old_zoom * factor))
+        if abs(new_zoom - old_zoom) < 1e-9:
+            return
+
+        if anchor is None:
+            anchor = QPointF(self.width() / 2, self.height() / 2)
+
+        # If we're in fit mode, seed the pan offset from the centred position
+        if self._zoom <= 0:
+            rw, rh = self._ref_size
+            sw = rw * old_zoom
+            sh = rh * old_zoom
+            self._pan_offset = QPointF(
+                (self.width() - sw) / 2,
+                (self.height() - sh) / 2,
+            )
+
+        # point in ref-image coords under the anchor
+        img_x = (anchor.x() - self._pan_offset.x()) / old_zoom
+        img_y = (anchor.y() - self._pan_offset.y()) / old_zoom
+
+        self._zoom = new_zoom
+        self._pan_offset = QPointF(
+            anchor.x() - img_x * new_zoom,
+            anchor.y() - img_y * new_zoom,
+        )
+        self._clamp_pan()
+        self.update()
+        return new_zoom
+
+    def current_zoom(self) -> float:
+        return self._effective_zoom()
+
+    # ── rendering ─────────────────────────────────────────────────────────────
+
+    def paintEvent(self, event):
+        painter = QPainter(self)
+        painter.setRenderHint(QPainter.SmoothPixmapTransform)
+        bg = self.palette().color(QPalette.Window)
+        painter.fillRect(self.rect(), bg)
+
+        if self._pixmap is None or self._ref_size is None:
+            painter.setPen(self.palette().color(QPalette.WindowText))
+            painter.drawText(self.rect(), Qt.AlignCenter, "No image loaded")
+            return
+
+        rw, rh = self._ref_size
+        z = self._effective_zoom()
+        # display size is always ref_size * zoom — independent of pixmap pixel count
+        sw = rw * z
+        sh = rh * z
+
+        if self._zoom <= 0:
+            ox = (self.width() - sw) / 2
+            oy = (self.height() - sh) / 2
+        else:
+            ox = self._pan_offset.x()
+            oy = self._pan_offset.y()
+
+        painter.drawPixmap(QRectF(ox, oy, sw, sh), self._pixmap,
+                           QRectF(0, 0, self._pixmap.width(), self._pixmap.height()))
+
+    def resizeEvent(self, event):
+        super().resizeEvent(event)
+        if self._zoom <= 0:
+            self._pan_offset = self._fit_offset(self._pixmap)
+        else:
+            self._clamp_pan()
+        self.update()
+
+    # ── mouse drag ────────────────────────────────────────────────────────────
+
+    def mousePressEvent(self, event):
+        if event.button() == Qt.LeftButton and self._pixmap is not None:
+            self._drag_active = True
+            self._drag_start_mouse = QPointF(event.position())
+            if self._zoom <= 0 and self._ref_size is not None:
+                # transition from fit: seed offset from the centred position
+                rw, rh = self._ref_size
+                z = self._effective_zoom()
+                self._zoom = z
+                self._pan_offset = QPointF(
+                    (self.width() - rw * z) / 2,
+                    (self.height() - rh * z) / 2,
+                )
+            self._drag_start_offset = QPointF(self._pan_offset)
+            self.setCursor(Qt.ClosedHandCursor)
+
+    def mouseMoveEvent(self, event):
+        if self._drag_active:
+            delta = QPointF(event.position()) - self._drag_start_mouse
+            self._pan_offset = self._drag_start_offset + delta
+            self._clamp_pan()
+            self.update()
+
+    def mouseReleaseEvent(self, event):
+        if event.button() == Qt.LeftButton:
+            self._drag_active = False
+            self.setCursor(Qt.OpenHandCursor)
+
+    # ── helpers ───────────────────────────────────────────────────────────────
+
+    def _effective_zoom(self) -> float:
+        """Return screen-pixels-per-ref-pixel zoom (fit or explicit)."""
+        rw, rh = self._ref_size if self._ref_size else (
+            (self._pixmap.width(), self._pixmap.height()) if self._pixmap else (1, 1)
+        )
+        if self._zoom > 0:
+            return self._zoom
+        # fit scale based on reference size
+        ww, wh = self.width(), self.height()
+        if rw == 0 or rh == 0:
+            return 1.0
+        return min(ww / rw, wh / rh)
+
+    def _fit_offset(self, pix: QPixmap | None) -> QPointF:
+        # unused now — fit mode is handled entirely in paintEvent
+        return QPointF(0, 0)
+
+    def _clamp_pan(self):
+        """Prevent panning so far that the image fully leaves the viewport."""
+        if self._ref_size is None:
+            return
+        rw, rh = self._ref_size
+        z = self._effective_zoom()
+        sw = rw * z
+        sh = rh * z
+        ww, wh = self.width(), self.height()
+        margin_x = min(sw, ww) * 0.5
+        margin_y = min(sh, wh) * 0.5
+        ox = self._pan_offset.x()
+        oy = self._pan_offset.y()
+        ox = max(-sw + margin_x, min(ww - margin_x, ox))
+        oy = max(-sh + margin_y, min(wh - margin_y, oy))
+        self._pan_offset = QPointF(ox, oy)
+
+
+# ---------------------------------------------------------------------------
+# Main window
+# ---------------------------------------------------------------------------
+
 class MainWindow(QMainWindow):
     processing_done = Signal(object)
+
     def __init__(self):
         super().__init__()
         self.setWindowTitle("Python prototype")
         self.image = None
         self.result = None
-        # Background worker state (thread pool)
+        self._showing_original = False
+
+        # Background worker state
         self._process_pool = concurrent.futures.ThreadPoolExecutor(max_workers=1)
         self._current_future = None
         self._pending_params = None
-
-        # connect processing_done signal to handler so callbacks run on GUI thread
         self.processing_done.connect(self._on_future_done)
 
-        # Menu bar (top strip for menus only)
-        menubar = QMenuBar(self)
+        # ── Menu bar ──────────────────────────────────────────────────────────
+        menubar = self.menuBar()
+
         file_menu = menubar.addMenu("File")
-
-        open_action = QAction("Open", self)
-        save_action = QAction("Save", self)
-        exit_action = QAction("Exit", self)
-
+        open_action = QAction("Open…", self, shortcut="Ctrl+O", triggered=self.open_image)
+        save_action = QAction("Save…", self, shortcut="Ctrl+S", triggered=self.save_result)
         file_menu.addAction(open_action)
         file_menu.addAction(save_action)
         file_menu.addSeparator()
-        file_menu.addAction(exit_action)
+        file_menu.addAction(QAction("Exit", self, triggered=self.close))
 
-        open_action.triggered.connect(self.open_image)
-        save_action.triggered.connect(self.save_result)
-        exit_action.triggered.connect(self.close)
+        edit_menu = menubar.addMenu("Edit")
+        edit_menu.addAction(QAction("Undo\tCtrl+Z", self))
+        edit_menu.addAction(QAction("Redo\tCtrl+Y", self))
+        edit_menu.addSeparator()
+        edit_menu.addAction(QAction("Preferences…", self))
 
-        self.setMenuBar(menubar)
+        view_menu = menubar.addMenu("View")
+        view_menu.addAction(QAction("Zoom In\tCtrl++", self))
+        view_menu.addAction(QAction("Zoom Out\tCtrl+-", self))
+        view_menu.addAction(QAction("Fit to Window", self, triggered=self._zoom_fit))
+        view_menu.addSeparator()
+        view_menu.addAction(QAction("Reset Layout", self))
 
-        # Central layout: left tools | preview | right tools
+        help_menu = menubar.addMenu("Help")
+        help_menu.addAction(QAction("Documentation", self))
+        help_menu.addSeparator()
+        help_menu.addAction(QAction("About…", self, triggered=self._show_about))
+        help_menu.addAction(QAction("Settings…", self, triggered=self._show_settings))
+
+        # ── Central layout ────────────────────────────────────────────────────
         central = QWidget()
         central_layout = QHBoxLayout()
         central.setLayout(central_layout)
         self.setCentralWidget(central)
 
-        # Left group (tools/actions)
+        # Left panel
         left_group = QGroupBox("Actions")
         left_layout = QVBoxLayout()
         left_group.setLayout(left_layout)
-
         self.open_btn = QPushButton("Open Image")
         self.save_btn = QPushButton("Save Result")
-
         left_layout.addWidget(self.open_btn)
         left_layout.addWidget(self.save_btn)
         left_layout.addStretch()
 
-        # Right group (processing options)
+        # Right panel
         right_group = QGroupBox("Processing")
         right_layout = QVBoxLayout()
         right_group.setLayout(right_layout)
@@ -89,7 +319,6 @@ class MainWindow(QMainWindow):
         self.scale_slider = QSlider(Qt.Horizontal)
         self.scale_slider.setRange(1, 400)
         self.scale_slider.setValue(100)
-
         self.scale_spin = QSpinBox()
         self.scale_spin.setRange(1, 400)
         self.scale_spin.setValue(100)
@@ -98,7 +327,6 @@ class MainWindow(QMainWindow):
         self.blur_slider = QSlider(Qt.Horizontal)
         self.blur_slider.setRange(0, 50)
         self.blur_slider.setValue(0)
-
         self.blur_spin = QDoubleSpinBox()
         self.blur_spin.setRange(0.0, 25.0)
         self.blur_spin.setSingleStep(0.5)
@@ -118,29 +346,20 @@ class MainWindow(QMainWindow):
         self.resample_combo = QComboBox()
         self.resample_combo.addItems(["Nearest", "Bilinear", "Bicubic", "Lanczos"])
         self.resample_map = {
-            0: Image.NEAREST,
-            1: Image.BILINEAR,
-            2: Image.BICUBIC,
-            3: Image.LANCZOS,
+            0: Image.NEAREST, 1: Image.BILINEAR,
+            2: Image.BICUBIC,  3: Image.LANCZOS,
         }
 
         right_layout.addWidget(QLabel("Scale"))
-        scale_container = QWidget()
-        scale_h = QHBoxLayout()
-        scale_h.setContentsMargins(0, 0, 0, 0)
-        scale_container.setLayout(scale_h)
-        scale_h.addWidget(self.scale_slider)
-        scale_h.addWidget(self.scale_spin)
-        right_layout.addWidget(scale_container)
+        sc = QWidget(); sl = QHBoxLayout(); sl.setContentsMargins(0,0,0,0); sc.setLayout(sl)
+        sl.addWidget(self.scale_slider); sl.addWidget(self.scale_spin)
+        right_layout.addWidget(sc)
 
         right_layout.addWidget(QLabel("Blur"))
-        blur_container = QWidget()
-        blur_h = QHBoxLayout()
-        blur_h.setContentsMargins(0, 0, 0, 0)
-        blur_container.setLayout(blur_h)
-        blur_h.addWidget(self.blur_slider)
-        blur_h.addWidget(self.blur_spin)
-        right_layout.addWidget(blur_container)
+        bc = QWidget(); bl = QHBoxLayout(); bl.setContentsMargins(0,0,0,0); bc.setLayout(bl)
+        bl.addWidget(self.blur_slider); bl.addWidget(self.blur_spin)
+        right_layout.addWidget(bc)
+
         right_layout.addWidget(QLabel("Colors"))
         right_layout.addWidget(self.colors_spin)
         right_layout.addWidget(self.dither_check)
@@ -149,45 +368,46 @@ class MainWindow(QMainWindow):
         right_layout.addWidget(self.resample_combo)
         right_layout.addStretch()
 
-        # Preview area
-        preview_container = QWidget()
-        preview_layout = QVBoxLayout()
-        preview_container.setLayout(preview_layout)
-
-        self.preview = QLabel(alignment=Qt.AlignCenter)
-        self.preview.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
-        self.preview.setMinimumSize(200, 200)
-        self.preview.setStyleSheet("background-color: #222; color: #ddd;")
-        self.preview.setText("No image loaded")
-
-        preview_layout.addWidget(self.preview)
+        # Canvas
+        self.preview = _PreviewCanvas()
+        self.preview.installEventFilter(self)   # for Ctrl+scroll
 
         central_layout.addWidget(left_group)
-        central_layout.addWidget(preview_container, 1)
+        central_layout.addWidget(self.preview, 1)
         central_layout.addWidget(right_group)
 
-        # Lock the side panels to a fixed width so changing label text never
-        # causes them to grow or shrink.
         _PANEL_WIDTH = 250
         left_group.setFixedWidth(_PANEL_WIDTH)
         right_group.setFixedWidth(_PANEL_WIDTH)
 
-        # Connections
+        # ── Bottom toolbar ────────────────────────────────────────────────────
+        bottom_toolbar = QToolBar("Tools", self)
+        bottom_toolbar.setMovable(False)
+        bottom_toolbar.setFloatable(False)
+        bottom_toolbar.setIconSize(QSize(16, 16))
+        self.addToolBar(Qt.BottomToolBarArea, bottom_toolbar)
+
+        self._before_btn = QToolButton()
+        self._before_btn.setText("⬛ Before / After")
+        self._before_btn.setToolTip("Hold to preview the original image")
+        self._before_btn.pressed.connect(self._show_before)
+        self._before_btn.released.connect(self._show_after)
+        bottom_toolbar.addWidget(self._before_btn)
+        bottom_toolbar.addSeparator()
+
+        # ── Connections ───────────────────────────────────────────────────────
         self.open_btn.clicked.connect(self.open_image)
         self.save_btn.clicked.connect(self.save_result)
 
-        # Live preview debounce timer
         self._preview_timer = QTimer(self)
         self._preview_timer.setSingleShot(True)
         self._preview_timer.setInterval(300)
         self._preview_timer.timeout.connect(self._do_preview)
 
-        # Wire control changes to schedule preview and sync widgets
         self.scale_slider.valueChanged.connect(self.scale_spin.setValue)
         self.scale_spin.valueChanged.connect(self.scale_slider.setValue)
         self.scale_spin.valueChanged.connect(self.schedule_preview)
 
-        # Blur: slider uses integer half-steps (0..50) while spinbox shows actual radius (0.0..25.0)
         self.blur_slider.valueChanged.connect(lambda v: self.blur_spin.setValue(v / 2.0))
         self.blur_spin.valueChanged.connect(lambda v: self.blur_slider.setValue(int(v * 2)))
         self.blur_spin.valueChanged.connect(self.schedule_preview)
@@ -198,34 +418,29 @@ class MainWindow(QMainWindow):
         self.resample_combo.currentIndexChanged.connect(self.schedule_preview)
 
         self._update_dither_controls()
-
         self.setMinimumSize(1100, 700)
         self.resize(1100, 700)
-
-        # ensure there is a status bar for simple busy feedback
         self.statusBar().showMessage("")
 
-    def _update_dither_controls(self):
-        """Enable/disable the dither method combo based on sklearn availability.
+    # ── Dither controls ───────────────────────────────────────────────────────
 
-        Bayer (k-means) requires sklearn; if it's not installed, lock the combo
-        to Floyd–Steinberg and grey it out so the user knows it's unavailable.
-        """
+    def _update_dither_controls(self):
         has_sklearn = sklearn_available()
         if not has_sklearn:
-            # Force selection to Floyd–Steinberg and disable choice
             self.dither_method_combo.setCurrentIndex(1)
         self.dither_method_combo.setEnabled(has_sklearn)
 
+    # ── Preview scheduling ────────────────────────────────────────────────────
+
     def schedule_preview(self, *_args):
-        # start or restart debounce timer
         self._preview_timer.start()
 
     def _do_preview(self):
-        # reuse apply_processing but don't block if no image
         if self.image is None:
             return
         self.apply_processing()
+
+    # ── Image I/O ─────────────────────────────────────────────────────────────
 
     def open_image(self):
         path, _ = QFileDialog.getOpenFileName(self, "Open image")
@@ -237,24 +452,55 @@ class MainWindow(QMainWindow):
             self.image = None
             return
         self.result = None
-        self.show_pil(self.image)
+        pix = QPixmap.fromImage(ImageQt(self.image.convert("RGBA")))
+        self._current_pixmap = pix
+        self.preview.set_pixmap(pix, ref_size=self.image.size)  # resets zoom/pan
 
     def show_pil(self, pil_img: Image.Image):
+        """Display a PIL image, preserving current zoom and pan."""
         qim = ImageQt(pil_img.convert("RGBA"))
         pix = QPixmap.fromImage(qim)
-        target = self.preview.size()
-        if target.width() <= 0 or target.height() <= 0:
-            self.preview.setPixmap(pix)
-            return
-        scaled = pix.scaled(target, Qt.KeepAspectRatio, Qt.SmoothTransformation)
-        self.preview.setPixmap(scaled)
+        self._current_pixmap = pix
+        self.preview.set_pixmap_keep_view(pix)
 
     def resizeEvent(self, event):
         super().resizeEvent(event)
-        if self.result is not None:
-            self.show_pil(self.result)
-        elif self.image is not None:
-            self.show_pil(self.image)
+        # canvas handles its own resize; nothing extra needed here
+
+    # ── Zoom ──────────────────────────────────────────────────────────────────
+
+    def eventFilter(self, obj, event):
+        """Ctrl+scroll on the canvas → zoom anchored to cursor."""
+        if obj is self.preview and isinstance(event, QWheelEvent):
+            if event.modifiers() & Qt.ControlModifier:
+                delta = event.angleDelta().y()
+                factor = 1.15 if delta > 0 else (1 / 1.15)
+                anchor = QPointF(event.position())
+                new_zoom = self.preview.apply_zoom(factor, anchor)
+                if new_zoom is not None:
+                    self.statusBar().showMessage(f"Zoom: {new_zoom * 100:.0f}%", 2000)
+                return True
+        return super().eventFilter(obj, event)
+
+    def _zoom_fit(self):
+        self.preview.reset_view()
+        self.statusBar().showMessage("Fit to window", 1500)
+
+    # ── Before / After ────────────────────────────────────────────────────────
+
+    def _show_before(self):
+        if self.image is None:
+            return
+        self._showing_original = True
+        self.show_pil(self.image)
+
+    def _show_after(self):
+        self._showing_original = False
+        img = self.result if self.result is not None else self.image
+        if img is not None:
+            self.show_pil(img)
+
+    # ── Processing ────────────────────────────────────────────────────────────
 
     def apply_processing(self):
         if self.image is None:
@@ -263,14 +509,11 @@ class MainWindow(QMainWindow):
         blur = self.blur_spin.value()
         colors = self.colors_spin.value()
         dither = self.dither_check.isChecked()
-        # 0 = Bayer (k-means), 1 = Floyd–Steinberg (Pillow)
         use_pillow_dither = self.dither_method_combo.currentIndex() == 1
         resample_idx = self.resample_combo.currentIndex()
         resample_filter = self.resample_map.get(resample_idx, Image.LANCZOS)
 
-        # Apply resample by resizing with chosen filter inside processing pipeline
         img = self.image.copy()
-        # ensure the image data is loaded from disk into memory (avoid lazy file handles)
         try:
             img.load()
         except Exception:
@@ -279,14 +522,10 @@ class MainWindow(QMainWindow):
             w, h = img.size
             new_size = (max(1, int(w * scale)), max(1, int(h * scale)))
             img = img.resize(new_size, resample=resample_filter)
-
         img = img if blur <= 0 else img.filter(ImageFilter.GaussianBlur(blur))
-
-        # Use background worker to avoid blocking the UI
         self._start_worker(img, colors, dither, use_pillow_dither)
 
     def _start_worker(self, img, colors, dither, use_pillow_dither=False):
-        # If a job is already running, store the latest params and return (coalesce)
         if self._current_future is not None and not self._current_future.done():
             self._pending_params = (img, colors, dither, use_pillow_dither)
             return
@@ -294,25 +533,18 @@ class MainWindow(QMainWindow):
         print("[gui] Submitting processing job: colors=", colors, "dither=", dither, "pillow=", use_pillow_dither)
         sys.stdout.flush()
 
-        # wrapper around process_image to trace start/finish inside the worker thread
         def _process_wrapper(img_, scale_, blur_, colors_, dither_, use_pillow_dither_):
-            print(f"[worker:{threading.get_ident()}] started process_image: colors={colors_} dither={dither_} pillow={use_pillow_dither_}")
+            print(f"[worker:{threading.get_ident()}] started process_image")
             sys.stdout.flush()
             res = process_image(img_, scale_, blur_, colors_, dither_, use_pillow_dither=use_pillow_dither_)
             print(f"[worker:{threading.get_ident()}] finished process_image")
             sys.stdout.flush()
             return res
 
-        # Submit processing to thread pool; pass PIL Image directly
         future = self._process_pool.submit(_process_wrapper, img, 1.0, 0.0, colors, dither, use_pillow_dither)
         self._current_future = future
-
-        # simple UI feedback
         self.statusBar().showMessage("Processing...")
-
-        # Use a Qt signal to marshal the Future to the GUI thread
         future.add_done_callback(lambda f: self.processing_done.emit(f))
-
         print("[gui] future running=", future.running(), "done=", future.done())
         sys.stdout.flush()
 
@@ -323,8 +555,6 @@ class MainWindow(QMainWindow):
                 self.show_pil(self.result)
             except Exception:
                 pass
-
-        # clear busy state
         self.statusBar().clearMessage()
         if self._pending_params is not None:
             params = self._pending_params
@@ -338,7 +568,6 @@ class MainWindow(QMainWindow):
         except Exception as exc:
             tb = traceback.format_exception(type(exc), exc, exc.__traceback__)
             print("Background worker exception:\n", "".join(tb))
-            # show short message to user
             try:
                 self.statusBar().showMessage(f"Processing failed: {exc}")
             except Exception:
@@ -347,42 +576,49 @@ class MainWindow(QMainWindow):
 
         if data:
             try:
-                # `data` is a PIL Image returned from the thread pool
                 if isinstance(data, Image.Image):
                     self.result = data
                 else:
-                    # unexpected type: try to load as bytes
-                    try:
-                        buf = io.BytesIO(data)
-                        img = Image.open(buf).copy()
-                        self.result = img
-                    except Exception:
-                        self.result = None
-
+                    self.result = None
                 if self.result is not None:
                     self.show_pil(self.result)
             except Exception as exc:
                 print("Failed to set result image:", exc)
 
-        # clear busy state
         print("[gui] Clearing busy state")
         self.statusBar().clearMessage()
-
-        # clear current future
         self._current_future = None
-
-        # refresh dither controls — sklearn may have become unavailable mid-session
         self._update_dither_controls()
 
-        # handle queued params
         if self._pending_params is not None:
             params = self._pending_params
             self._pending_params = None
             self._start_worker(*params)
 
+    # ── About / Settings ──────────────────────────────────────────────────────
+
+    def _show_about(self):
+        QMessageBox.about(
+            self, "About",
+            "<b>Python Prototype</b><br><br>"
+            "An image processing tool.<br><br>"
+            "Built with PySide6 and Pillow.",
+        )
+
+    def _show_settings(self):
+        dlg = QDialog(self)
+        dlg.setWindowTitle("Settings")
+        dlg.setMinimumWidth(320)
+        layout = QVBoxLayout(dlg)
+        layout.addWidget(QLabel("Settings will be added here."))
+        buttons = QDialogButtonBox(QDialogButtonBox.Ok)
+        buttons.accepted.connect(dlg.accept)
+        layout.addWidget(buttons)
+        dlg.exec()
+
+    # ── Close ─────────────────────────────────────────────────────────────────
+
     def closeEvent(self, event):
-        # Attempt to stop any running worker thread promptly
-        # If a process-based worker is running, try to cancel and shutdown pool
         try:
             if self._current_future is not None and not self._current_future.done():
                 try:
@@ -390,20 +626,15 @@ class MainWindow(QMainWindow):
                     self._current_future.cancel()
                 except Exception:
                     pass
-
-            # attempt to shutdown pool without waiting
             try:
                 self._process_pool.shutdown(wait=False)
             except Exception:
                 pass
-
-            # try to terminate any leftover worker processes (best-effort)
             try:
                 procs = getattr(self._process_pool, "_processes", {})
                 for p in list(procs.values()):
                     try:
-                        p.terminate()
-                        p.join(1)
+                        p.terminate(); p.join(1)
                     except Exception:
                         pass
             except Exception:
@@ -413,11 +644,11 @@ class MainWindow(QMainWindow):
         super().closeEvent(event)
 
     def save_result(self):
-        # Save current result or image if no processed result
         target = self.result or self.image
         if target is None:
             return
-        path, _ = QFileDialog.getSaveFileName(self, "Save result", filter="PNG Files (*.png);;All Files (*)")
+        path, _ = QFileDialog.getSaveFileName(
+            self, "Save result", filter="PNG Files (*.png);;All Files (*)")
         if not path:
             return
         try:
