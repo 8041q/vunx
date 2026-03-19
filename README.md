@@ -91,5 +91,5 @@ d:/Users/guivt/Documents/Projects/test/.venv/Scripts/python.exe -m nuitka \
 
 ### Next improvements
 
-- Expose Bayer matrix order as a user control
-- Add Floyd–Steinberg option for users who prefer error-diffusion aesthetics
+- Expose Bayer matrix order as a user control [verify]
+- Add Floyd–Steinberg option for users who prefer error-diffusion aesthetics [completed]

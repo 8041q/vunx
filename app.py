@@ -1,5 +1,5 @@
 # Top-level runner to preserve package context for Nuitka builds.
-# `python -m nuitka app.py`
+# run at root `python -m nuitka app`
 
 from src import run
 
