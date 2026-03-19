@@ -1,0 +1,6 @@
+pillow==12.1.1
+numpy==2.4.3
+PySide6==6.10.2
+
+# if not installed, code fallsback to pillow Floyd-Steinberg
+scikit-learn==1.8.0

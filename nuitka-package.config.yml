@@ -1,0 +1,31 @@
+# Minimal Nuitka package configuration skeleton for this project.
+# Adjust entries as needed when testing the built executable on Windows.
+
+- module-name: 'PySide6'
+  # Qt plugins (platform, imageformats, etc.) are often required at runtime
+  # when building standalone applications. Tune `data-files` paths to match
+  # where PySide6/Qt keeps its plugins on your system.
+  data-files:
+    dirs:
+      - 'plugins'
+    when: 'win32 and arch_amd64'
+
+- module-name: 'numpy'
+  # Ensure binary artifacts and any package data are included for numpy.
+  data-files:
+    patterns:
+      - '*.dll'
+      - '*.pyd'
+
+- module-name: 'PIL'
+  # Include any native DLLs and font files Pillow may require.
+  data-files:
+    patterns:
+      - '*.dll'
+      - 'fonts/*'
+
+# Notes:
+# - Use `--user-package-configuration-file` with Nuitka to pass this file
+#   during builds, e.g. `--user-package-configuration-file=nuitka-package.config.yml`.
+# - This is a starting point; after an initial build, inspect missing files/errors
+#   and expand `data-files`, `dlls`, or `import-hacks` as required.
