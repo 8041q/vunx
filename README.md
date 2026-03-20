@@ -30,8 +30,9 @@ python -m app
 * **Preprocessing** – Gaussian blur for smoother quantization results
 * **Adaptive Palette** – Intelligent color reduction
 * **Vectorized Dithering** – Optional Bayer (ordered) dithering powered by NumPy (no pixel-by-pixel loops)
-* **Live Preview** – Instantly see results
-* **Export** – Save processed images
+* **Emissive Dreamy Style** – Neon, dream-like image processing with glow, gradient maps, and film grain
+* **Live Preview** – Instantly see results (draft mode for fast feedback)
+* **Export** – Save processed images at full resolution
 
 ---
 
@@ -93,3 +94,21 @@ d:/Users/guivt/Documents/Projects/test/.venv/Scripts/python.exe -m nuitka \
 
 - Expose Bayer matrix order as a user control [verify]
 - Add Floyd–Steinberg option for users who prefer error-diffusion aesthetics [completed]
+
+---
+
+## Future: Graphic Overlays
+
+The Emissive Dreamy style guide describes optional graphic overlay elements that are not yet implemented:
+
+* **Warning labels** – Translucent caution/warning text overlays
+* **UI dots** – Small circular elements scattered across the image
+* **Geometric patterns** – Triangles, hexagons, grid lines as decorative layers
+* **Tech textures** – Circuit-board or HUD-style texture overlays
+
+These would be added as PNG overlays or generated shape layers composited at low opacity on top of the processed image. Planned approach:
+
+1. Overlay asset loader (accept user-provided PNG files)
+2. Built-in geometric shape generators (grids, triangles, circles)
+3. Per-overlay controls: position, rotation, opacity, blend mode
+4. Layer stack UI for ordering and toggling multiple overlays
