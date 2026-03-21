@@ -13,10 +13,26 @@ Each step is a standalone function.  ``process_emissive()`` orchestrates them.
 
 from __future__ import annotations
 
-import numpy as np
-from PIL import Image, ImageFilter
-
 from .blending import BLEND_MODES
+
+np = None
+Image = None
+ImageFilter = None
+_n = None
+_Image = None
+_ImageFilter = None
+
+
+def _lazy_emissive_deps():
+    global np, Image, ImageFilter, _n, _Image, _ImageFilter
+    if _n is None or _Image is None or _ImageFilter is None:
+        import numpy as local_np
+        from PIL import Image as local_Image, ImageFilter as local_ImageFilter
+        np = local_np
+        Image = local_Image
+        ImageFilter = local_ImageFilter
+        _n, _Image, _ImageFilter = np, Image, ImageFilter
+    return np, Image, ImageFilter
 
 
 # ---------------------------------------------------------------------------
@@ -25,6 +41,7 @@ from .blending import BLEND_MODES
 
 def _img_to_float(img: Image.Image) -> tuple[np.ndarray, np.ndarray, tuple[int, int]]:
     """Convert PIL RGBA → (rgb float32 [0,1] shape (H,W,3), alpha uint8 (H,W), (W,H))."""
+    np, Image, ImageFilter = _lazy_emissive_deps()
     rgba = np.asarray(img.convert("RGBA"))
     h, w = rgba.shape[:2]
     rgb = rgba[..., :3].astype(np.float32) / 255.0
@@ -34,6 +51,7 @@ def _img_to_float(img: Image.Image) -> tuple[np.ndarray, np.ndarray, tuple[int, 
 
 def _float_to_img(rgb: np.ndarray, alpha: np.ndarray, size: tuple[int, int]) -> Image.Image:
     """float32 (H,W,3) [0,1] + uint8 alpha (H,W) → PIL RGBA."""
+    np, Image, ImageFilter = _lazy_emissive_deps()
     w, h = size
     out = np.empty((h, w, 4), dtype=np.uint8)
     out[..., :3] = np.clip(rgb * 255.0, 0, 255).astype(np.uint8)
@@ -345,8 +363,9 @@ def process_emissive(
     # 2. Color grading
     if p["color_mode"] == "gradient_map":
         img = apply_gradient_map(img, p["gm_shadow"], p["gm_mid"], p["gm_highlight"])
-    else:
+    elif p["color_mode"] == "colorize":
         img = apply_colorize(img, p["colorize_hue"], p["colorize_sat"])
+    # "none" → skip, pass image through unchanged
 
     # 3. Glow
     if p["glow_enabled"]:
