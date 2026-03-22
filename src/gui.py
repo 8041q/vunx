@@ -839,7 +839,43 @@ class MainWindow(QMainWindow):
         self._update_dither_controls()   # re-apply sklearn availability constraint
         self.schedule_preview()
 
+    def _reset_quant_params_silent(self):
+        """Reset quantization controls to defaults without triggering a preview."""
+        widgets = [
+            self.scale_slider, self.scale_spin,
+            self.blur_slider, self.blur_spin,
+            self.colors_spin, self.dither_check,
+            self.dither_method_combo, self.resample_combo,
+        ]
+        for w in widgets:
+            w.blockSignals(True)
+
+        self.scale_slider.setValue(100)
+        self.scale_spin.setValue(100)
+        self.blur_slider.setValue(0)
+        self.blur_spin.setValue(0.0)
+        self.colors_spin.setValue(256)
+        self.dither_check.setChecked(False)
+        self.dither_method_combo.setCurrentIndex(0)
+        self.resample_combo.setCurrentIndex(0)
+
+        for w in widgets:
+            w.blockSignals(False)
+        self._update_dither_controls()
+
+    def _reset_emissive_params_silent(self):
+        """Reset emissive controls to neutral defaults without triggering a preview."""
+        self._em_preset_combo.blockSignals(True)
+        self._em_preset_combo.setCurrentIndex(0)
+        self._em_preset_combo.blockSignals(False)
+        self._apply_emissive_params(_get_emissive().EMISSIVE_NEUTRAL, trigger_preview=False)
+
     def _reset_emissive_params(self):
+        """Reset all Emissive Dreamy controls to neutral and set combo to Default."""
+        self._em_preset_combo.blockSignals(True)
+        self._em_preset_combo.setCurrentIndex(0)
+        self._em_preset_combo.blockSignals(False)
+        self._apply_emissive_params(_get_emissive().EMISSIVE_NEUTRAL)
         """Reset all Emissive Dreamy controls to neutral and set combo to Default."""
         self._em_preset_combo.blockSignals(True)
         self._em_preset_combo.setCurrentIndex(0)
@@ -1005,6 +1041,12 @@ class MainWindow(QMainWindow):
         self._current_pixmap = pix
         self.preview.set_pixmap(pix, ref_size=self._working_image.size)
 
+        # Reset both tabs to their defaults whenever a new image is opened,
+        # but suppress the per-widget preview signals — fire one preview at the end.
+        self._reset_quant_params_silent()
+        self._reset_emissive_params_silent()
+        self.schedule_preview()
+
     def show_pil(self, pil_img):
         """Display a PIL image, preserving current zoom and pan."""
         ImageQt = _get_PIL_ImageQt()
@@ -1045,8 +1087,10 @@ class MainWindow(QMainWindow):
     def _on_tab_changed(self, _idx: int):
         if self._working_image is None:
             return
+        # Discard any stale preview from the previous tab and immediately
+        # schedule a fresh one using the new tab's current parameters.
         self._preview_image = None
-        self.show_pil(self._working_image)
+        self.schedule_preview()
 
     def _show_after(self):
         self._showing_original = False
