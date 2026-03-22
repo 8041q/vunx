@@ -44,6 +44,10 @@ def _worker_process(mode: str, img_bytes: bytes, params: dict, draft: bool) -> b
 
     if mode == "emissive":
         result = process_emissive(img, params, draft=draft)
+    elif params.get("passthrough", False):
+        # All quant params are at neutral — skip the pipeline entirely so
+        # the image is returned pixel-perfect with no lossy round-trip.
+        result = img
     else:
         result = process_image(
             img, 1.0, 0.0,

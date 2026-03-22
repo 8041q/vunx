@@ -301,37 +301,46 @@ def _draft_upscale(img: Image.Image, original_size: tuple[int, int]) -> Image.Im
 # Orchestrator
 # ---------------------------------------------------------------------------
 
-# Default parameters — also used by the GUI preset
-EMISSIVE_DEFAULTS: dict = {
-    # Levels
-    "levels_shadow": 30,
-    "levels_highlight": 220,
-    "levels_gamma": 1.2,
-    # Color grading
-    "color_mode": "gradient_map",  # "gradient_map" | "colorize"
-    "gm_shadow": (10, 15, 40),
-    "gm_mid": (0, 180, 220),
-    "gm_highlight": (230, 240, 255),
-    "colorize_hue": 210,
-    "colorize_sat": 70,
-    # Glow
-    "glow_enabled": True,
-    "glow_blur": 20.0,
+# Neutral / identity parameters — every effect is a pass-through or disabled.
+# This is what ``process_emissive`` falls back to for any missing key, and
+# what the GUI uses when the user picks "Default" (clean slate / reset).
+#
+# Rules for "neutral":
+#   - Levels  : shadow=0, highlight=255, gamma=1.0  → identity remap
+#   - Color   : "none"                               → no colour change
+#   - Glow / Softness / Bloom / Grain : enabled=False → no effect applied
+#
+# Preset files (JSON) override whichever keys they need; they do NOT live here.
+EMISSIVE_NEUTRAL: dict = {
+    # Levels — identity pass-through
+    "levels_shadow": 0,
+    "levels_highlight": 255,
+    "levels_gamma": 1.0,
+    # Color grading — disabled
+    "color_mode": "none",          # "none" | "gradient_map" | "colorize"
+    "gm_shadow": (0, 0, 0),
+    "gm_mid": (128, 128, 128),
+    "gm_highlight": (255, 255, 255),
+    "colorize_hue": 0,
+    "colorize_sat": 0,
+    # Glow — disabled
+    "glow_enabled": False,
+    "glow_blur": 10.0,
     "glow_blend": "Screen",
-    "glow_opacity": 0.6,
+    "glow_opacity": 0.5,
     "glow_threshold": 128,
-    # Softness
-    "soft_enabled": True,
-    "soft_blur": 3.0,
+    # Softness — disabled
+    "soft_enabled": False,
+    "soft_blur": 2.0,
     "soft_blend": "Soft Light",
     "soft_opacity": 0.2,
-    # Color bloom
+    # Color bloom — disabled
     "bloom_enabled": False,
-    "bloom_color": (0, 200, 255),
+    "bloom_color": (255, 255, 255),
     "bloom_blend": "Overlay",
-    "bloom_opacity": 0.15,
-    # Grain
-    "grain_enabled": True,
+    "bloom_opacity": 0.2,
+    # Grain — disabled
+    "grain_enabled": False,
     "grain_intensity": 0.08,
     "grain_type": "gaussian",
 }
@@ -347,11 +356,11 @@ def process_emissive(
 
     Args:
         img: Source PIL Image.
-        params: Dict of parameters (keys from EMISSIVE_DEFAULTS).
+        params: Dict of parameters (keys from EMISSIVE_NEUTRAL).
                 Missing keys fall back to defaults.
         draft: If True, process at reduced resolution for live preview.
     """
-    p = {**EMISSIVE_DEFAULTS, **(params or {})}
+    p = {**EMISSIVE_NEUTRAL, **(params or {})}
 
     original_size = img.size
     if draft:

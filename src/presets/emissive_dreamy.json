@@ -1,0 +1,35 @@
+{
+    "_name": "Emissive Dreamy",
+    "_description": "Cool-toned dreamy glow with gradient map, soft bloom and film grain.",
+
+    "levels_shadow": 30,
+    "levels_highlight": 220,
+    "levels_gamma": 1.2,
+
+    "color_mode": "gradient_map",
+    "gm_shadow": [10, 15, 40],
+    "gm_mid": [0, 180, 220],
+    "gm_highlight": [230, 240, 255],
+    "colorize_hue": 210,
+    "colorize_sat": 70,
+
+    "glow_enabled": true,
+    "glow_blur": 20.0,
+    "glow_blend": "Screen",
+    "glow_opacity": 0.6,
+    "glow_threshold": 128,
+
+    "soft_enabled": true,
+    "soft_blur": 3.0,
+    "soft_blend": "Soft Light",
+    "soft_opacity": 0.2,
+
+    "bloom_enabled": false,
+    "bloom_color": [0, 200, 255],
+    "bloom_blend": "Overlay",
+    "bloom_opacity": 0.15,
+
+    "grain_enabled": true,
+    "grain_intensity": 0.08,
+    "grain_type": "gaussian"
+}

@@ -35,10 +35,45 @@ from PySide6.QtWidgets import (
 from PySide6.QtCore import Qt, QTimer, Signal, QSize, QPointF, QRectF, QPropertyAnimation, QEasingCurve
 from PySide6.QtGui import QPixmap, QAction, QWheelEvent, QPainter, QCursor, QPalette, QColor
 import sys
+import json
+import pathlib
 import traceback
 import concurrent.futures
 import multiprocessing
 import threading
+
+# ---------------------------------------------------------------------------
+# Preset discovery — scan the ``presets/`` folder next to this file for any
+# *.json files.  Each file is one preset; ``_name`` inside the JSON is the
+# display label (falls back to the filename stem).
+# ---------------------------------------------------------------------------
+
+_PRESETS_DIR = pathlib.Path(__file__).parent / "presets"
+
+
+def _load_emissive_presets() -> list[dict]:
+    """Return a list of preset dicts loaded from presets/*.json.
+
+    Each dict contains all the raw JSON values plus a synthetic ``_path`` key
+    with the source file.  JSON arrays that represent RGB triples are converted
+    to tuples so the rest of the code doesn't need to care about the difference.
+    """
+    presets = []
+    if not _PRESETS_DIR.exists():
+        return presets
+    for p in sorted(_PRESETS_DIR.glob("*.json")):
+        try:
+            data = json.loads(p.read_text(encoding="utf-8"))
+            # Coerce JSON arrays that represent RGB triples to tuples
+            for key in ("gm_shadow", "gm_mid", "gm_highlight", "bloom_color"):
+                if key in data and isinstance(data[key], list):
+                    data[key] = tuple(data[key])
+            data.setdefault("_name", p.stem.replace("_", " ").title())
+            data["_path"] = str(p)
+            presets.append(data)
+        except Exception as exc:
+            print(f"[presets] failed to load {p}: {exc}")
+    return presets
 
 
 # ---------------------------------------------------------------------------
@@ -451,10 +486,10 @@ class MainWindow(QMainWindow):
 
         self.colors_spin = QSpinBox()
         self.colors_spin.setRange(2, 256)
-        self.colors_spin.setValue(16)
+        self.colors_spin.setValue(256)
 
         self.dither_check = QCheckBox("Dither")
-        self.dither_check.setChecked(True)
+        self.dither_check.setChecked(False)
 
         self.dither_method_combo = QComboBox()
         self.dither_method_combo.addItems(["Bayer (k-means)", "Floyd–Steinberg"])
@@ -482,6 +517,11 @@ class MainWindow(QMainWindow):
         right_layout.addWidget(QLabel("Resample"))
         right_layout.addWidget(self.resample_combo)
         right_layout.addStretch()
+
+        quant_reset_btn = QPushButton("\u21ba  Reset")
+        quant_reset_btn.setToolTip("Reset all quantization parameters to their defaults")
+        quant_reset_btn.clicked.connect(self._reset_quant_params)
+        right_layout.addWidget(quant_reset_btn)
 
         self._right_tabs.addTab(quant_widget, "Quantization")
 
@@ -551,9 +591,8 @@ class MainWindow(QMainWindow):
         self.resize(1100, 700)
         self.statusBar().showMessage("")
 
-        # Emissive widgets were built from EMISSIVE_DEFAULTS (Filter1 values).
-        # Reset to clean slate now that timer, preview canvas, and all widgets exist.
-        self._apply_clean_defaults(trigger_preview=False)
+        # Apply neutral defaults now that all widgets, timer, and canvas exist.
+        self._apply_emissive_params(_get_emissive().EMISSIVE_NEUTRAL, trigger_preview=False)
 
     # ── Worker pre-warm ───────────────────────────────────────────────────────
 
@@ -581,7 +620,6 @@ class MainWindow(QMainWindow):
     # ── Emissive tab builder ──────────────────────────────────────────────────
 
     def _build_emissive_tab(self):
-        d = _get_emissive().EMISSIVE_DEFAULTS
 
         inner = QWidget()
         inner_layout = QVBoxLayout(inner)
@@ -598,12 +636,15 @@ class MainWindow(QMainWindow):
             return row
 
         # Preset row
+        self._emissive_presets: list[dict] = _load_emissive_presets()
         preset_row = QWidget()
         preset_layout = QHBoxLayout(preset_row)
         preset_layout.setContentsMargins(0, 0, 0, 0)
         preset_layout.addWidget(QLabel("Preset"))
         self._em_preset_combo = QComboBox()
-        self._em_preset_combo.addItems(["Default", "Filter1"])
+        self._em_preset_combo.addItem("Default")          # index 0 — always clean slate
+        for preset in self._emissive_presets:
+            self._em_preset_combo.addItem(preset["_name"])
         self._em_preset_combo.currentIndexChanged.connect(self._on_emissive_preset_changed)
         preset_layout.addWidget(self._em_preset_combo)
         inner_layout.addWidget(preset_row)
@@ -760,11 +801,50 @@ class MainWindow(QMainWindow):
         inner_layout.addWidget(grain_grp)
         inner_layout.addStretch()
 
+        em_reset_btn = QPushButton("\u21ba  Reset")
+        em_reset_btn.setToolTip("Reset all emissive parameters to neutral defaults")
+        em_reset_btn.clicked.connect(self._reset_emissive_params)
+        inner_layout.addWidget(em_reset_btn)
+
         scroll = QScrollArea()
         scroll.setWidgetResizable(True)
         scroll.setWidget(inner)
         scroll.setFrameShape(QFrame.NoFrame)
         self._right_tabs.addTab(scroll, "Emissive Dreamy")
+
+    # ── Tab reset helpers ─────────────────────────────────────────────────────
+
+    def _reset_quant_params(self):
+        """Reset all Quantization tab controls to their startup defaults."""
+        widgets = [
+            self.scale_slider, self.scale_spin,
+            self.blur_slider, self.blur_spin,
+            self.colors_spin, self.dither_check,
+            self.dither_method_combo, self.resample_combo,
+        ]
+        for w in widgets:
+            w.blockSignals(True)
+
+        self.scale_slider.setValue(100)
+        self.scale_spin.setValue(100)
+        self.blur_slider.setValue(0)
+        self.blur_spin.setValue(0.0)
+        self.colors_spin.setValue(256)
+        self.dither_check.setChecked(False)
+        self.dither_method_combo.setCurrentIndex(0)
+        self.resample_combo.setCurrentIndex(0)   # Nearest — widget startup default
+
+        for w in widgets:
+            w.blockSignals(False)
+        self._update_dither_controls()   # re-apply sklearn availability constraint
+        self.schedule_preview()
+
+    def _reset_emissive_params(self):
+        """Reset all Emissive Dreamy controls to neutral and set combo to Default."""
+        self._em_preset_combo.blockSignals(True)
+        self._em_preset_combo.setCurrentIndex(0)
+        self._em_preset_combo.blockSignals(False)
+        self._apply_emissive_params(_get_emissive().EMISSIVE_NEUTRAL)
 
     # ── Emissive helpers ──────────────────────────────────────────────────────
 
@@ -779,104 +859,91 @@ class MainWindow(QMainWindow):
             self._em_preset_combo.setCurrentIndex(0)  # back to "Default" (free edit)
             self._em_preset_combo.blockSignals(False)
 
-    def _on_emissive_preset_changed(self, idx):
+    def _on_emissive_preset_changed(self, idx: int):
         if idx == 0:
-            self._apply_clean_defaults()
-        elif idx == 1:
-            self._apply_emissive_filter1()
+            self._apply_emissive_params(_get_emissive().EMISSIVE_NEUTRAL)
+        else:
+            preset = self._emissive_presets[idx - 1]   # offset by 1 for "Default" slot
+            self._apply_emissive_params(preset)
 
-    def _apply_clean_defaults(self, trigger_preview: bool = True):
-        """Reset all emissive controls to a true neutral clean slate.
+    def _apply_emissive_params(self, params: dict, trigger_preview: bool = True):
+        """Push any dict of emissive parameter values onto the UI widgets.
 
-        Rules:
-          - Levels: shadow=0, highlight=255, gamma=1.0  → identity, no remap
-          - Color mode: Colorize at saturation=0  → pure greyscale, no colour cast
-            (Gradient Map cannot be made identity so Colorize+sat=0 is the true no-op)
-          - Glow / Softness / Bloom / Grain: all disabled  → no effect applied
-          - Non-enabled params (blur amounts, blend modes, colours) are left at
-            whatever the widgets currently hold — they are irrelevant while disabled,
-            and this avoids any dependency on emissive.py internals here.
+        Only the keys present in *params* are applied; everything else keeps its
+        current widget value.  This means you can pass a sparse preset (e.g. only
+        ``glow_enabled``) and all unmentioned controls are untouched.
+
+        Adding a new parameter to the pipeline never requires changing this method —
+        just add the key to the widget-map below.
         """
+        # Map: param key → callable that sets the widget value
+        # Entries are (setter,) for write-only, or (blocker_widget, setter) when
+        # the same widget should have signals blocked while being set.
+        def _color_mode_index(mode: str) -> int:
+            return {"none": 0, "gradient_map": 1, "colorize": 2}.get(mode, 0)
+
+        def _combo_text(combo: QComboBox, text: str):
+            combo.setCurrentText(text)
+
+        widget_setters = {
+            "levels_shadow":    lambda v: self._em_shadow_spin.setValue(int(v)),
+            "levels_highlight": lambda v: self._em_highlight_spin.setValue(int(v)),
+            "levels_gamma":     lambda v: self._em_gamma_spin.setValue(float(v)),
+            "color_mode":       lambda v: self._em_color_mode.setCurrentIndex(_color_mode_index(v)),
+            "gm_shadow":        lambda v: self._em_gm_shadow_btn.set_color(tuple(v)),
+            "gm_mid":           lambda v: self._em_gm_mid_btn.set_color(tuple(v)),
+            "gm_highlight":     lambda v: self._em_gm_highlight_btn.set_color(tuple(v)),
+            "colorize_hue":     lambda v: self._em_hue_spin.setValue(int(v)),
+            "colorize_sat":     lambda v: self._em_sat_spin.setValue(int(v)),
+            "glow_enabled":     lambda v: self._em_glow_check.setChecked(bool(v)),
+            "glow_blur":        lambda v: self._em_glow_blur_spin.setValue(int(v)),
+            "glow_blend":       lambda v: _combo_text(self._em_glow_blend, v),
+            "glow_opacity":     lambda v: self._em_glow_opacity_spin.setValue(int(float(v) * 100)),
+            "glow_threshold":   lambda v: self._em_glow_thresh_spin.setValue(int(v)),
+            "soft_enabled":     lambda v: self._em_soft_check.setChecked(bool(v)),
+            "soft_blur":        lambda v: self._em_soft_blur_spin.setValue(float(v)),
+            "soft_blend":       lambda v: _combo_text(self._em_soft_blend, v),
+            "soft_opacity":     lambda v: self._em_soft_opacity_spin.setValue(int(float(v) * 100)),
+            "bloom_enabled":    lambda v: self._em_bloom_check.setChecked(bool(v)),
+            "bloom_color":      lambda v: self._em_bloom_color_btn.set_color(tuple(v)),
+            "bloom_blend":      lambda v: _combo_text(self._em_bloom_blend, v),
+            "bloom_opacity":    lambda v: self._em_bloom_opacity_spin.setValue(int(float(v) * 100)),
+            "grain_enabled":    lambda v: self._em_grain_check.setChecked(bool(v)),
+            "grain_intensity":  lambda v: self._em_grain_spin.setValue(int(float(v) * 100)),
+            "grain_type":       lambda v: _combo_text(self._em_grain_type, str(v).capitalize()),
+        }
+
+        # Collect every widget that will be touched so we can block/unblock in bulk
         all_widgets = [
             self._em_shadow_spin, self._em_shadow_slider,
             self._em_highlight_spin, self._em_highlight_slider,
-            self._em_gamma_spin,
-            self._em_color_mode, self._em_hue_spin, self._em_sat_spin,
-            self._em_glow_check,
-            self._em_soft_check,
-            self._em_bloom_check,
-            self._em_grain_check,
-        ]
-        for w in all_widgets:
-            w.blockSignals(True)
-
-        # Levels — identity pass-through
-        self._em_shadow_spin.setValue(0)
-        self._em_shadow_slider.setValue(0)
-        self._em_highlight_spin.setValue(255)
-        self._em_highlight_slider.setValue(255)
-        self._em_gamma_spin.setValue(1.0)
-
-        # Color grading — None is a true passthrough, no colour change at all
-        self._em_color_mode.setCurrentIndex(0)  # None
-        self._em_hue_spin.setValue(0)
-        self._em_sat_spin.setValue(0)
-
-        # All effects off
-        self._em_glow_check.setChecked(False)
-        self._em_soft_check.setChecked(False)
-        self._em_bloom_check.setChecked(False)
-        self._em_grain_check.setChecked(False)
-
-        for w in all_widgets:
-            w.blockSignals(False)
-        self._update_color_mode_visibility()
-        if trigger_preview:
-            self.schedule_preview()
-
-    def _apply_emissive_filter1(self):
-        d = _get_emissive().EMISSIVE_DEFAULTS   # ← lazy accessor, not a bare name
-        widgets = [
-            self._em_shadow_spin, self._em_highlight_spin, self._em_gamma_spin,
-            self._em_color_mode, self._em_hue_spin, self._em_sat_spin,
+            self._em_gamma_spin, self._em_color_mode,
+            self._em_gm_shadow_btn, self._em_gm_mid_btn, self._em_gm_highlight_btn,
+            self._em_hue_spin, self._em_sat_spin,
             self._em_glow_check, self._em_glow_blur_spin, self._em_glow_blend,
             self._em_glow_opacity_spin, self._em_glow_thresh_spin,
             self._em_soft_check, self._em_soft_blur_spin, self._em_soft_blend,
             self._em_soft_opacity_spin,
-            self._em_bloom_check, self._em_bloom_blend, self._em_bloom_opacity_spin,
+            self._em_bloom_check, self._em_bloom_color_btn, self._em_bloom_blend,
+            self._em_bloom_opacity_spin,
             self._em_grain_check, self._em_grain_spin, self._em_grain_type,
         ]
-        for w in widgets:
+        for w in all_widgets:
             w.blockSignals(True)
-        self._em_shadow_spin.setValue(d["levels_shadow"])
-        self._em_highlight_spin.setValue(d["levels_highlight"])
-        self._em_gamma_spin.setValue(d["levels_gamma"])
-        self._em_color_mode.setCurrentIndex(1 if d["color_mode"] == "gradient_map" else 2)
-        self._em_gm_shadow_btn.set_color(d["gm_shadow"])
-        self._em_gm_mid_btn.set_color(d["gm_mid"])
-        self._em_gm_highlight_btn.set_color(d["gm_highlight"])
-        self._em_hue_spin.setValue(d["colorize_hue"])
-        self._em_sat_spin.setValue(d["colorize_sat"])
-        self._em_glow_check.setChecked(d["glow_enabled"])
-        self._em_glow_blur_spin.setValue(int(d["glow_blur"]))
-        self._em_glow_blend.setCurrentText(d["glow_blend"])
-        self._em_glow_opacity_spin.setValue(int(d["glow_opacity"] * 100))
-        self._em_glow_thresh_spin.setValue(d["glow_threshold"])
-        self._em_soft_check.setChecked(d["soft_enabled"])
-        self._em_soft_blur_spin.setValue(d["soft_blur"])
-        self._em_soft_blend.setCurrentText(d["soft_blend"])
-        self._em_soft_opacity_spin.setValue(int(d["soft_opacity"] * 100))
-        self._em_bloom_check.setChecked(d["bloom_enabled"])
-        self._em_bloom_color_btn.set_color(d["bloom_color"])
-        self._em_bloom_blend.setCurrentText(d["bloom_blend"])
-        self._em_bloom_opacity_spin.setValue(int(d["bloom_opacity"] * 100))
-        self._em_grain_check.setChecked(d["grain_enabled"])
-        self._em_grain_spin.setValue(int(d["grain_intensity"] * 100))
-        self._em_grain_type.setCurrentText(d["grain_type"].capitalize())
-        for w in widgets:
+
+        for key, setter in widget_setters.items():
+            if key in params:
+                try:
+                    setter(params[key])
+                except Exception as exc:
+                    print(f"[presets] failed to apply '{key}': {exc}")
+
+        for w in all_widgets:
             w.blockSignals(False)
+
         self._update_color_mode_visibility()
-        self.schedule_preview()
+        if trigger_preview:
+            self.schedule_preview()
 
     def _collect_emissive_params(self) -> dict:
         return {
@@ -992,6 +1059,19 @@ class MainWindow(QMainWindow):
     def _is_emissive_mode(self) -> bool:
         return self._right_tabs.currentIndex() == 1
 
+    def _quant_is_passthrough(self) -> bool:
+        """Return True when all quantization controls are at their neutral values.
+
+        At neutral the pipeline produces a pixel-identical result, so we can
+        skip the worker entirely and show the working image directly.
+        """
+        return (
+            self.scale_spin.value() == 100
+            and self.blur_spin.value() == 0.0
+            and self.colors_spin.value() == 256
+            and not self.dither_check.isChecked()
+        )
+
     def _build_quant_inputs(self) -> tuple:
         Image = _get_PIL_Image()
         ImageFilter = _get_PIL_ImageFilter()
@@ -1010,7 +1090,12 @@ class MainWindow(QMainWindow):
             new_size = (max(1, int(w * scale)), max(1, int(h * scale)))
             img = img.resize(new_size, resample=resample_filter)
         img = img if blur <= 0 else img.filter(ImageFilter.GaussianBlur(blur))
-        return img, {"colors": colors, "dither": dither, "use_pillow_dither": use_pillow_dither}
+        return img, {
+            "colors": colors,
+            "dither": dither,
+            "use_pillow_dither": use_pillow_dither,
+            "passthrough": self._quant_is_passthrough(),
+        }
 
     def apply_processing(self):
         if self._working_image is None:
@@ -1021,6 +1106,11 @@ class MainWindow(QMainWindow):
                 self._collect_emissive_params(), draft=True, commit=False,
             )
         else:
+            if self._quant_is_passthrough():
+                # Nothing to do — show the working image pixel-perfect.
+                self._preview_image = None
+                self.show_pil(self._working_image)
+                return
             img, params = self._build_quant_inputs()
             self._start_worker_generic("quantize", img, params, draft=False, commit=False)
 
