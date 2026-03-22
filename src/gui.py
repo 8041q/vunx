@@ -390,6 +390,7 @@ class MainWindow(QMainWindow):
         super().__init__()
         self.setWindowTitle("Python prototype")
         self.image = None
+        self._source_image = None   # original load — never mutated; all jobs read from here
         self._working_image = None
         self._preview_image = None
         self._undo_stack = []
@@ -1031,7 +1032,8 @@ class MainWindow(QMainWindow):
         except Exception:
             self.image = None
             return
-        self._working_image = self.image.convert("RGBA").copy()
+        self._source_image = self.image.convert("RGBA").copy()
+        self._working_image = self._source_image.copy()
         self._preview_image = None
         self._undo_stack.clear()
         self._redo_stack.clear()
@@ -1042,10 +1044,10 @@ class MainWindow(QMainWindow):
         self.preview.set_pixmap(pix, ref_size=self._working_image.size)
 
         # Reset both tabs to their defaults whenever a new image is opened,
-        # but suppress the per-widget preview signals — fire one preview at the end.
+        # but suppress the per-widget preview signals and skip the auto-commit
+        # timer — the freshly loaded image is already displayed above.
         self._reset_quant_params_silent()
         self._reset_emissive_params_silent()
-        self.schedule_preview()
 
     def show_pil(self, pil_img):
         """Display a PIL image, preserving current zoom and pan."""
@@ -1087,8 +1089,11 @@ class MainWindow(QMainWindow):
     def _on_tab_changed(self, _idx: int):
         if self._working_image is None:
             return
-        # Discard any stale preview from the previous tab and immediately
-        # schedule a fresh one using the new tab's current parameters.
+        # Show whatever was last displayed (preview or committed) while the
+        # new tab's worker job is in flight, then schedule a fresh preview
+        # using the new tab's current parameters.
+        img = self._preview_image if self._preview_image is not None else self._working_image
+        self.show_pil(img)
         self._preview_image = None
         self.schedule_preview()
 
@@ -1128,7 +1133,7 @@ class MainWindow(QMainWindow):
         # Resolve the string name to the actual Image constant lazily
         resample_name = self.resample_map.get(resample_idx, "LANCZOS")
         resample_filter = getattr(Image, resample_name, Image.LANCZOS)
-        img = self._working_image.copy()
+        img = self._source_image.copy()
         if scale != 1.0:
             w, h = img.size
             new_size = (max(1, int(w * scale)), max(1, int(h * scale)))
@@ -1159,13 +1164,13 @@ class MainWindow(QMainWindow):
             self._start_worker_generic("quantize", img, params, draft=False, commit=False)
 
     def _apply_working(self):
-        if self._working_image is None:
+        if self._source_image is None:
             return
         self._apply_btn.setEnabled(False)
         self.statusBar().showMessage("Applying…")
         if self._is_emissive_mode():
             self._start_worker_generic(
-                "emissive", self._working_image.copy(),
+                "emissive", self._source_image.copy(),
                 self._collect_emissive_params(), draft=False, commit=True,
             )
         else:
